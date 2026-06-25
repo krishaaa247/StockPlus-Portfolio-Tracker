@@ -1,3 +1,5 @@
+import html
+import anthropic
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -196,6 +198,42 @@ st.markdown("""
     /* Select/spinner */
     .stSelectbox > div,
     .stSpinner { color: #8b949e; }
+
+    /* AI chat */
+    .chat-row {
+        display: flex;
+        margin: 10px 0;
+        width: 100%;
+    }
+    .chat-row.user { justify-content: flex-end; }
+    .chat-row.assistant { justify-content: flex-start; }
+    .chat-bubble {
+        max-width: 82%;
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid #30363d;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+        line-height: 1.55;
+    }
+    .chat-bubble.user {
+        background: linear-gradient(135deg, #1f6feb 0%, #2ea043 100%);
+        color: #f0f6fc;
+        border-bottom-right-radius: 6px;
+    }
+    .chat-bubble.assistant {
+        background: #161b22;
+        color: #e6edf3;
+        border-bottom-left-radius: 6px;
+    }
+    .chat-role {
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 1.2px;
+        text-transform: uppercase;
+        color: #8b949e;
+        margin-bottom: 6px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -206,6 +244,15 @@ if "portfolio" not in st.session_state:
 
 if "prices_cache" not in st.session_state:
     st.session_state.prices_cache = {}
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "current_symbol" not in st.session_state:
+    st.session_state.current_symbol = ""
+
+if "stock_context" not in st.session_state:
+    st.session_state.stock_context = ""
 
 
 # ─── Helper Functions ───────────────────────────────────────────────────────────
@@ -344,6 +391,256 @@ def get_extreme_pnl_stock(dataframe: pd.DataFrame, column: str, extreme: str):
         raise ValueError("extreme must be 'max' or 'min'")
 
     return valid_df.loc[idx], None
+
+
+def format_market_cap(value):
+    if value is None or pd.isna(value):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    absolute_value = abs(value)
+    for divisor, suffix in [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]:
+        if absolute_value >= divisor:
+            return f"${value / divisor:.2f}{suffix}"
+    return f"${value:,.0f}"
+
+
+def compute_rsi(close_series: pd.Series, period: int = 14):
+    if close_series is None:
+        return None
+
+    numeric_series = pd.to_numeric(close_series, errors="coerce").dropna()
+    if numeric_series.size <= period:
+        return None
+
+    deltas = numeric_series.diff().dropna()
+    if deltas.empty:
+        return None
+
+    gains = deltas.clip(lower=0)
+    losses = -deltas.clip(upper=0)
+
+    avg_gain = gains.tail(period).mean()
+    avg_loss = losses.tail(period).mean()
+
+    if pd.isna(avg_gain) or pd.isna(avg_loss):
+        return None
+
+    if avg_loss == 0:
+        return 100.0 if avg_gain > 0 else 50.0
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return round(float(rsi), 2)
+
+
+@st.cache_data(ttl=600)
+def fetch_ai_stock_snapshot(symbol: str):
+    snapshot = {
+        "symbol": symbol,
+        "warnings": [],
+        "current_price": None,
+        "one_week_change": None,
+        "one_month_change": None,
+        "fifty_two_week_high": None,
+        "fifty_two_week_low": None,
+        "pe_ratio": None,
+        "beta": None,
+        "market_cap": None,
+        "sector": None,
+        "sma_7": None,
+        "sma_20": None,
+        "rsi_14": None,
+        "closing_prices": [],
+        "sma_signal": None,
+        "rsi_signal": None,
+    }
+
+    try:
+        ticker = yf.Ticker(symbol)
+    except Exception:
+        snapshot["warnings"].append("Could not initialise yfinance ticker data.")
+        return snapshot
+
+    history = None
+    try:
+        history = ticker.history(period="1y", auto_adjust=False)
+    except Exception:
+        snapshot["warnings"].append("yfinance price history failed to load.")
+
+    if history is not None and not history.empty and "Close" in history.columns:
+        close_series = pd.to_numeric(history["Close"], errors="coerce").dropna()
+        if not close_series.empty:
+            snapshot["current_price"] = round(float(close_series.iloc[-1]), 2)
+            snapshot["closing_prices"] = [round(float(value), 2) for value in close_series.tail(30).tolist()]
+
+            if len(close_series) >= 6 and close_series.iloc[-6] not in [0, None]:
+                snapshot["one_week_change"] = round(((close_series.iloc[-1] - close_series.iloc[-6]) / close_series.iloc[-6]) * 100, 2)
+            else:
+                snapshot["warnings"].append("1-week change unavailable.")
+
+            if len(close_series) >= 22 and close_series.iloc[-22] not in [0, None]:
+                snapshot["one_month_change"] = round(((close_series.iloc[-1] - close_series.iloc[-22]) / close_series.iloc[-22]) * 100, 2)
+            else:
+                snapshot["warnings"].append("1-month change unavailable.")
+
+            snapshot["fifty_two_week_high"] = round(float(close_series.max()), 2)
+            snapshot["fifty_two_week_low"] = round(float(close_series.min()), 2)
+            snapshot["sma_7"] = round(float(close_series.tail(7).mean()), 2) if len(close_series) >= 7 else None
+            snapshot["sma_20"] = round(float(close_series.tail(20).mean()), 2) if len(close_series) >= 20 else None
+            snapshot["rsi_14"] = compute_rsi(close_series, 14)
+
+            if snapshot["sma_7"] is not None and snapshot["sma_20"] is not None:
+                snapshot["sma_signal"] = "Bullish" if snapshot["sma_7"] > snapshot["sma_20"] else "Bearish" if snapshot["sma_7"] < snapshot["sma_20"] else "Neutral"
+
+            if snapshot["rsi_14"] is not None:
+                if snapshot["rsi_14"] < 30:
+                    snapshot["rsi_signal"] = "Oversold (bullish signal)"
+                elif snapshot["rsi_14"] > 70:
+                    snapshot["rsi_signal"] = "Overbought (bearish signal)"
+                else:
+                    snapshot["rsi_signal"] = "Neutral"
+        else:
+            snapshot["warnings"].append("No usable closing prices were returned by yfinance.")
+    else:
+        snapshot["warnings"].append("yfinance history was empty.")
+
+    try:
+        info = ticker.info or {}
+    except Exception:
+        info = {}
+        snapshot["warnings"].append("Fundamental data failed to load.")
+
+    current_price = info.get("currentPrice") or info.get("regularMarketPrice")
+    if current_price is None and snapshot["current_price"] is not None:
+        current_price = snapshot["current_price"]
+    if current_price is not None:
+        snapshot["current_price"] = round(float(current_price), 2)
+
+    field_map = {
+        "pe_ratio": info.get("trailingPE"),
+        "beta": info.get("beta"),
+        "market_cap": format_market_cap(info.get("marketCap")),
+        "sector": info.get("sector"),
+    }
+    for key, value in field_map.items():
+        if value is not None and not (isinstance(value, float) and pd.isna(value)):
+            if key in {"pe_ratio", "beta"}:
+                try:
+                    snapshot[key] = round(float(value), 2)
+                except (TypeError, ValueError):
+                    snapshot["warnings"].append(f"{key.replace('_', ' ').title()} unavailable.")
+            else:
+                snapshot[key] = value
+        else:
+            snapshot["warnings"].append(f"{key.replace('_', ' ').title()} unavailable.")
+
+    return snapshot
+
+
+def build_stock_context(snapshot: dict):
+    context_lines = [f"Symbol: {snapshot['symbol']}"]
+
+    if snapshot.get("current_price") is not None:
+        context_lines.append(f"Current price: ₹{snapshot['current_price']:.2f}")
+    if snapshot.get("one_week_change") is not None:
+        context_lines.append(f"1-week % change: {snapshot['one_week_change']:.2f}%")
+    if snapshot.get("one_month_change") is not None:
+        context_lines.append(f"1-month % change: {snapshot['one_month_change']:.2f}%")
+    if snapshot.get("fifty_two_week_high") is not None:
+        context_lines.append(f"52-week high: ₹{snapshot['fifty_two_week_high']:.2f}")
+    if snapshot.get("fifty_two_week_low") is not None:
+        context_lines.append(f"52-week low: ₹{snapshot['fifty_two_week_low']:.2f}")
+    if snapshot.get("pe_ratio") is not None:
+        context_lines.append(f"P/E ratio: {snapshot['pe_ratio']:.2f}")
+    if snapshot.get("beta") is not None:
+        context_lines.append(f"Beta: {snapshot['beta']:.2f}")
+    if snapshot.get("market_cap"):
+        context_lines.append(f"Market cap: {snapshot['market_cap']}")
+    if snapshot.get("sector"):
+        context_lines.append(f"Sector: {snapshot['sector']}")
+    if snapshot.get("sma_7") is not None:
+        context_lines.append(f"7-day SMA: ₹{snapshot['sma_7']:.2f}")
+    if snapshot.get("sma_20") is not None:
+        context_lines.append(f"20-day SMA: ₹{snapshot['sma_20']:.2f}")
+    if snapshot.get("sma_signal"):
+        context_lines.append(f"SMA crossover signal: {snapshot['sma_signal']}")
+    if snapshot.get("rsi_14") is not None:
+        context_lines.append(f"14-day RSI: {snapshot['rsi_14']:.2f}")
+    if snapshot.get("rsi_signal"):
+        context_lines.append(f"RSI signal: {snapshot['rsi_signal']}")
+    if snapshot.get("closing_prices"):
+        context_lines.append(f"Last 30 closing prices: {snapshot['closing_prices']}")
+
+    return "\n".join(context_lines)
+
+
+def get_anthropic_api_key():
+    try:
+        return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        return None
+
+
+def ask_claude(symbol, stock_context, chat_history, user_message):
+    client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+    system_prompt = f"""You are an expert stock analyst. You have this real data for {symbol}:
+{stock_context}
+Give RISE / FALL / NEUTRAL predictions with confidence level.
+Format: 📈 PREDICTION: RISE (Medium Confidence)
+Use bullet points. End with a risk disclaimer. Only use data provided."""
+
+    messages = chat_history + [{"role": "user", "content": user_message}]
+
+    response = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1000,
+        system=system_prompt,
+        messages=messages,
+    )
+    return response.content[0].text
+
+
+def render_chat_message(role: str, content: str):
+    bubble_role = "user" if role == "user" else "assistant"
+    safe_content = html.escape(content).replace("\n", "<br>")
+    role_label = "You" if role == "user" else "AI Analyst"
+    st.markdown(
+        f"""
+        <div class='chat-row {bubble_role}'>
+            <div class='chat-bubble {bubble_role}'>
+                <div class='chat-role'>{role_label}</div>
+                {safe_content}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def submit_ai_message(symbol: str, message: str):
+    api_key = get_anthropic_api_key()
+    if not api_key:
+        st.error("Add ANTHROPIC_API_KEY to .streamlit/secrets.toml")
+        return
+
+    stock_context = st.session_state.stock_context
+    if not stock_context:
+        st.error("Stock context is unavailable. Please reselect the stock.")
+        return
+
+    st.session_state.chat_history.append({"role": "user", "content": message})
+
+    try:
+        reply = ask_claude(symbol, stock_context, st.session_state.chat_history[:-1], message)
+        st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Claude API request failed: {exc}")
 
 
 # ─── Sidebar ────────────────────────────────────────────────────────────────────
@@ -518,7 +815,7 @@ with col5:
 
 
 # ─── Tabs ───────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["Overview", "Stock Details", "Benchmark"])
+tab1, tab2, tab3, tab4 = st.tabs(["Overview", "Stock Details", "Benchmark", "🤖 AI Analyst"])
 
 CHART_LAYOUT = dict(
     paper_bgcolor="#0d1117",
@@ -753,3 +1050,71 @@ with tab3:
             </div>""", unsafe_allow_html=True)
     else:
         st.info("Could not load benchmark or portfolio history with valid numeric prices. Try a different period or verify yfinance data access.")
+
+
+# ─── TAB 4: AI Analyst ─────────────────────────────────────────────────────────
+with tab4:
+    st.warning("⚠ AI predictions are for educational purposes only. Not financial advice.")
+
+    portfolio_symbols = df["Symbol"].tolist()
+    if not portfolio_symbols:
+        st.info("Add at least one stock to your portfolio to start an AI conversation.")
+    else:
+        if "ai_selected_stock" not in st.session_state or st.session_state.ai_selected_stock not in portfolio_symbols:
+            st.session_state.ai_selected_stock = portfolio_symbols[0]
+
+        selected_symbol = st.selectbox(
+            "Select stock from portfolio",
+            options=portfolio_symbols,
+            index=portfolio_symbols.index(st.session_state.ai_selected_stock),
+            key="ai_selected_stock",
+        )
+
+        if st.session_state.current_symbol != selected_symbol:
+            st.session_state.current_symbol = selected_symbol
+            st.session_state.chat_history = []
+
+        snapshot = fetch_ai_stock_snapshot(selected_symbol)
+        st.session_state.stock_context = build_stock_context(snapshot)
+
+        if snapshot.get("warnings"):
+            unique_warnings = sorted(set(snapshot["warnings"]))
+            st.warning("Some yfinance fields were unavailable: " + ", ".join(unique_warnings))
+
+        if not get_anthropic_api_key():
+            st.error("Add ANTHROPIC_API_KEY to .streamlit/secrets.toml")
+
+        clear_col, spacer_col = st.columns([1, 4])
+        with clear_col:
+            if st.button("Clear Chat", use_container_width=True):
+                st.session_state.chat_history = []
+                st.rerun()
+
+        st.markdown("<div class='section-title'>Quick Questions</div>", unsafe_allow_html=True)
+        quick_questions = [
+            "Will this stock rise or fall?",
+            "Good time to buy?",
+            "Analyse RSI",
+            "SMA crossover trend?",
+            "Key risks?",
+            "Hold or sell?",
+        ]
+
+        for row_start in (0, 3):
+            row_questions = quick_questions[row_start:row_start + 3]
+            row_columns = st.columns(3)
+            for column_index, question in enumerate(row_questions):
+                with row_columns[column_index]:
+                    if st.button(question, key=f"ai_quick_{selected_symbol}_{row_start}_{column_index}", use_container_width=True):
+                        submit_ai_message(selected_symbol, question)
+
+        st.markdown("<div class='section-title'>Conversation</div>", unsafe_allow_html=True)
+        if st.session_state.chat_history:
+            for message in st.session_state.chat_history:
+                render_chat_message(message["role"], message["content"])
+        else:
+            st.info("Ask a question or use a quick prompt to get started.")
+
+        user_message = st.chat_input("Ask the AI Analyst about this stock")
+        if user_message:
+            submit_ai_message(selected_symbol, user_message)
