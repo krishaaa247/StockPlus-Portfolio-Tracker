@@ -204,8 +204,9 @@ st.markdown("""
         border-bottom: 2px solid #58a6ff;
     }
 
-    /* Remove Streamlit branding */
-    #MainMenu, footer, header { visibility: hidden; }
+    /* Remove non-essential Streamlit branding without hiding the app header.
+       The sidebar expand/collapse control can live in the header on Streamlit Cloud. */
+    #MainMenu, footer { visibility: hidden; }
 
     /* Divider */
     hr { border-color: #21262d; }
@@ -293,6 +294,19 @@ if "ai_available" not in st.session_state:
 
 if "last_updated" not in st.session_state:
     st.session_state.last_updated = None
+
+
+SAMPLE_PORTFOLIO = [
+    {"symbol": "RELIANCE.NS", "qty": 10,  "buy_price": 2400.0},
+    {"symbol": "TCS.NS",      "qty": 5,   "buy_price": 3500.0},
+    {"symbol": "INFY.NS",     "qty": 20,  "buy_price": 1450.0},
+    {"symbol": "HDFCBANK.NS", "qty": 15,  "buy_price": 1600.0},
+    {"symbol": "ITC.NS",      "qty": 50,  "buy_price": 420.0},
+]
+
+
+def load_sample_portfolio():
+    st.session_state.portfolio = [stock.copy() for stock in SAMPLE_PORTFOLIO]
 
 
 # ─── Helper Functions ───────────────────────────────────────────────────────────
@@ -521,6 +535,20 @@ def fetch_yfinance_snapshot(symbol: str):
 
 
 def build_portfolio_df():
+    columns = [
+        "Symbol",
+        "Quantity",
+        "Buy Price",
+        "Current Price",
+        "Invested Amount",
+        "Current Value",
+        "P&L",
+        "P&L (%)",
+        "Qty",
+        "Invested (₹)",
+        "Value (₹)",
+        "P&L (₹)",
+    ]
     rows = []
     for stock in st.session_state.portfolio:
         sym = stock["symbol"]
@@ -559,6 +587,8 @@ def build_portfolio_df():
         df["Invested (₹)"] = df["Invested Amount"]
         df["Value (₹)"] = df["Current Value"]
         df["P&L (₹)"] = df["P&L"]
+    else:
+        df = pd.DataFrame(columns=columns)
 
     return df
 
@@ -997,13 +1027,7 @@ with st.sidebar:
     st.markdown("---")
     # Quick sample portfolio
     if st.button("📋 Load Sample Portfolio", use_container_width=True):
-        st.session_state.portfolio = [
-            {"symbol": "RELIANCE.NS", "qty": 10,  "buy_price": 2400.0},
-            {"symbol": "TCS.NS",      "qty": 5,   "buy_price": 3500.0},
-            {"symbol": "INFY.NS",     "qty": 20,  "buy_price": 1450.0},
-            {"symbol": "HDFCBANK.NS", "qty": 15,  "buy_price": 1600.0},
-            {"symbol": "ITC.NS",      "qty": 50,  "buy_price": 420.0},
-        ]
+        load_sample_portfolio()
         st.rerun()
 
     if st.button("🗑️ Clear Portfolio", use_container_width=True):
@@ -1012,15 +1036,20 @@ with st.sidebar:
 
 
 # ─── Main Area ──────────────────────────────────────────────────────────────────
-if not st.session_state.portfolio:
+portfolio_is_empty = not st.session_state.portfolio
+if portfolio_is_empty:
     st.markdown("""
-    <div style='text-align:center; padding: 80px 20px; color:#8b949e;'>
+    <div style='text-align:center; padding: 44px 20px 24px; color:#8b949e;'>
         <div style='font-size:48px; margin-bottom:16px;'>📊</div>
         <div style='font-size:20px; font-weight:600; color:#c9d1d9; margin-bottom:8px;'>No stocks yet</div>
         <div style='font-size:14px;'>Add stocks from the sidebar, or load the sample portfolio to get started.</div>
     </div>
     """, unsafe_allow_html=True)
-    st.stop()
+    _, sample_col, _ = st.columns([2, 1, 2])
+    with sample_col:
+        if st.button("Load Sample Portfolio", key="main_load_sample_portfolio", use_container_width=True):
+            load_sample_portfolio()
+            st.rerun()
 
 # Build dataframe
 with st.spinner("Fetching live prices…"):
@@ -1028,7 +1057,7 @@ with st.spinner("Fetching live prices…"):
 
 with st.expander("Debug portfolio calculations", expanded=False):
     st.write(df.head())
-    st.write(df.dtypes)
+    st.write(df.dtypes.astype(str))
     debug_cols = [col for col in ["Current Price", "Current Value", "P&L", "P&L (%)"] if col in df.columns]
     if debug_cols:
         st.write(df[debug_cols])
@@ -1093,42 +1122,65 @@ CHART_LAYOUT = dict(
 )
 
 
+def build_empty_chart(message: str):
+    fig = go.Figure()
+    fig.add_annotation(
+        text=message,
+        x=0.5,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        showarrow=False,
+        font=dict(color="#8b949e", size=14),
+    )
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False)
+    fig.update_layout(height=320, **CHART_LAYOUT)
+    return fig
+
+
 # ─── TAB 1: Overview ────────────────────────────────────────────────────────────
 with tab1:
     col_left, col_right = st.columns([1, 1])
 
     with col_left:
         st.markdown("<div class='section-title'>Allocation</div>", unsafe_allow_html=True)
-        pie = px.pie(
-            df,
-            names="Symbol",
-            values="Current Value",
-            hole=0.55,
-            color_discrete_sequence=["#58a6ff","#3fb950","#d2a8ff","#ffa657","#f85149","#79c0ff","#56d364"],
-        )
-        pie.update_traces(textinfo="percent+label", textfont_size=12)
-        pie.update_layout(
-            showlegend=True,
-            **CHART_LAYOUT
-        )
+        if df.empty:
+            pie = build_empty_chart("Add stocks to see portfolio allocation.")
+        else:
+            pie = px.pie(
+                df,
+                names="Symbol",
+                values="Current Value",
+                hole=0.55,
+                color_discrete_sequence=["#58a6ff","#3fb950","#d2a8ff","#ffa657","#f85149","#79c0ff","#56d364"],
+            )
+            pie.update_traces(textinfo="percent+label", textfont_size=12)
+            pie.update_layout(
+                showlegend=True,
+                **CHART_LAYOUT
+            )
         st.plotly_chart(pie, use_container_width=True, config={"displayModeBar": False})
 
     with col_right:
         st.markdown("<div class='section-title'>P&L per Stock</div>", unsafe_allow_html=True)
-        bar_colors = ["#3fb950" if v >= 0 else "#f85149" for v in df["P&L"]]
-        bar = go.Figure(go.Bar(
-            x=df["Symbol"],
-            y=df["P&L"],
-            marker_color=bar_colors,
-            text=[f"{'+'if v>=0 else ''}{v:,.0f}" for v in df["P&L"]],
-            textposition="outside",
-            textfont=dict(size=11, color="#e6edf3"),
-        ))
-        bar.update_layout(
-            xaxis=dict(showgrid=False, color="#8b949e", tickfont=dict(size=12)),
-            yaxis=dict(showgrid=True, gridcolor="#21262d", color="#8b949e", tickprefix="₹"),
-            **CHART_LAYOUT
-        )
+        if df.empty:
+            bar = build_empty_chart("Add stocks to see profit and loss.")
+        else:
+            bar_colors = ["#3fb950" if v >= 0 else "#f85149" for v in df["P&L"]]
+            bar = go.Figure(go.Bar(
+                x=df["Symbol"],
+                y=df["P&L"],
+                marker_color=bar_colors,
+                text=[f"{'+'if v>=0 else ''}{v:,.0f}" for v in df["P&L"]],
+                textposition="outside",
+                textfont=dict(size=11, color="#e6edf3"),
+            ))
+            bar.update_layout(
+                xaxis=dict(showgrid=False, color="#8b949e", tickfont=dict(size=12)),
+                yaxis=dict(showgrid=True, gridcolor="#21262d", color="#8b949e", tickprefix="₹"),
+                **CHART_LAYOUT
+            )
         st.plotly_chart(bar, use_container_width=True, config={"displayModeBar": False})
 
 
@@ -1205,6 +1257,12 @@ with tab2:
             **CHART_LAYOUT
         )
         st.plotly_chart(fig_hist, use_container_width=True, config={"displayModeBar": False})
+    else:
+        st.plotly_chart(
+            build_empty_chart("Add stocks to compare price history."),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
 
 
 # ─── TAB 3: Benchmark ────────────────────────────────────────────────────────────
@@ -1267,56 +1325,65 @@ with tab3:
 
         if port_norm is None or bench_norm is None:
             st.info("Portfolio or benchmark history does not contain enough valid numeric data to calculate returns.")
-            st.stop()
+            st.plotly_chart(
+                build_empty_chart("Add holdings with valid price history to compare against a benchmark."),
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+        else:
+            fig_bench = go.Figure()
+            fig_bench.add_trace(go.Scatter(
+                x=port_norm.index,
+                y=port_norm.values,
+                name="My Portfolio",
+                line=dict(color="#58a6ff", width=2.5),
+            ))
+            fig_bench.add_trace(go.Scatter(
+                x=bench_norm.index,
+                y=bench_norm.values,
+                name=chosen_label,
+                line=dict(color="#8b949e", width=1.5, dash="dot"),
+            ))
+            fig_bench.add_hline(y=100, line_dash="dash", line_color="#21262d", line_width=1)
+            fig_bench.update_layout(
+                yaxis=dict(showgrid=True, gridcolor="#21262d", color="#8b949e", ticksuffix=""),
+                xaxis=dict(showgrid=False, color="#8b949e"),
+                hovermode="x unified",
+                **CHART_LAYOUT
+            )
+            st.plotly_chart(fig_bench, use_container_width=True, config={"displayModeBar": False})
 
-        fig_bench = go.Figure()
-        fig_bench.add_trace(go.Scatter(
-            x=port_norm.index,
-            y=port_norm.values,
-            name="My Portfolio",
-            line=dict(color="#58a6ff", width=2.5),
-        ))
-        fig_bench.add_trace(go.Scatter(
-            x=bench_norm.index,
-            y=bench_norm.values,
-            name=chosen_label,
-            line=dict(color="#8b949e", width=1.5, dash="dot"),
-        ))
-        fig_bench.add_hline(y=100, line_dash="dash", line_color="#21262d", line_width=1)
-        fig_bench.update_layout(
-            yaxis=dict(showgrid=True, gridcolor="#21262d", color="#8b949e", ticksuffix=""),
-            xaxis=dict(showgrid=False, color="#8b949e"),
-            hovermode="x unified",
-            **CHART_LAYOUT
-        )
-        st.plotly_chart(fig_bench, use_container_width=True, config={"displayModeBar": False})
+            # Outperformance
+            port_ret  = round(float(port_norm.iloc[-1]) - 100, 2)
+            bench_ret = round(float(bench_norm.iloc[-1]) - 100, 2)
+            alpha     = round(port_ret - bench_ret, 2)
 
-        # Outperformance
-        port_ret  = round(float(port_norm.iloc[-1]) - 100, 2)
-        bench_ret = round(float(bench_norm.iloc[-1]) - 100, 2)
-        alpha     = round(port_ret - bench_ret, 2)
+            c1, c2, c3 = st.columns(3)
+            sign = lambda v: ("+" if v >= 0 else "")
+            cls  = lambda v: "metric-delta-pos" if v >= 0 else "metric-delta-neg"
 
-        c1, c2, c3 = st.columns(3)
-        sign = lambda v: ("+" if v >= 0 else "")
-        cls  = lambda v: "metric-delta-pos" if v >= 0 else "metric-delta-neg"
-
-        with c1:
-            st.markdown(f"""<div class='metric-card'>
-                <div class='metric-label'>Portfolio Return</div>
-                <div class='metric-value' style='font-size:22px;'>{sign(port_ret)}{port_ret}%</div>
-            </div>""", unsafe_allow_html=True)
-        with c2:
-            st.markdown(f"""<div class='metric-card'>
-                <div class='metric-label'>{chosen_label} Return</div>
-                <div class='metric-value' style='font-size:22px;'>{sign(bench_ret)}{bench_ret}%</div>
-            </div>""", unsafe_allow_html=True)
-        with c3:
-            st.markdown(f"""<div class='metric-card'>
-                <div class='metric-label'>Alpha (Outperformance)</div>
-                <div class='metric-value' style='font-size:22px;'><span class='{cls(alpha)}'>{sign(alpha)}{alpha}%</span></div>
-            </div>""", unsafe_allow_html=True)
+            with c1:
+                st.markdown(f"""<div class='metric-card'>
+                    <div class='metric-label'>Portfolio Return</div>
+                    <div class='metric-value' style='font-size:22px;'>{sign(port_ret)}{port_ret}%</div>
+                </div>""", unsafe_allow_html=True)
+            with c2:
+                st.markdown(f"""<div class='metric-card'>
+                    <div class='metric-label'>{chosen_label} Return</div>
+                    <div class='metric-value' style='font-size:22px;'>{sign(bench_ret)}{bench_ret}%</div>
+                </div>""", unsafe_allow_html=True)
+            with c3:
+                st.markdown(f"""<div class='metric-card'>
+                    <div class='metric-label'>Alpha (Outperformance)</div>
+                    <div class='metric-value' style='font-size:22px;'><span class='{cls(alpha)}'>{sign(alpha)}{alpha}%</span></div>
+                </div>""", unsafe_allow_html=True)
     else:
         st.info("Could not load benchmark or portfolio history with valid numeric prices. Try a different period or verify yfinance data access.")
+        st.plotly_chart(
+            build_empty_chart("Add holdings to compare portfolio performance with a benchmark."),
+            use_container_width=True,
+            config={"displayModeBar": False},
+        )
 
 
 # ─── TAB 4: AI Analyst ─────────────────────────────────────────────────────────
